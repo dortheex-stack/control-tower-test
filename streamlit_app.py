@@ -319,6 +319,18 @@ st.markdown("""
   .status-running { color: var(--blue); font-weight: 500; }
   .status-done    { color: var(--green); font-weight: 500; }
 
+  /* Step sub-note */
+  .step-note {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    margin-top: 4px;
+    font-style: italic;
+    line-height: 1.3;
+    white-space: normal;
+  }
+  .step-card.running .step-note { color: var(--blue); }
+  .step-card.done    .step-note { color: var(--green); }
+
   /* Chat */
   [data-testid="stChatMessage"] {
     background: var(--surface) !important;
@@ -359,14 +371,19 @@ st.markdown("""
 
 
 # ------------------------------------------------------------
-# Session state
+# Session state  (initialise EVERYTHING before any rendering)
 # ------------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "steps" not in st.session_state:
-    st.session_state.steps = []
+    # Initialise with pending status and empty note right away
+    st.session_state.steps = [
+        {"status": "pending", "note": ""} for _ in range(3)
+    ]
 if "quick_prompt" not in st.session_state:
     st.session_state.quick_prompt = None
+if "last_response" not in st.session_state:
+    st.session_state.last_response = ""   # plain-text accumulator
 
 
 # ------------------------------------------------------------
@@ -469,7 +486,7 @@ manager = LlmAgent(
         "Be specific to the cooperative context. Prioritise member value and operational "
         "continuity. Do not skip steps."
     ),
-    max_iterations=3,
+    max_iterations=10,
 )
 
 runner = Runner(
@@ -492,9 +509,13 @@ def render_steps(placeholder):
     html = ""
     for i, step in enumerate(st.session_state.steps):
         status = step["status"]
+        note   = step.get("note", "")
         defn   = STEP_DEFS[i]
         bar    = '<div class="step-progress"></div>' if status == "running" else ""
         label  = {"pending": "Afventer", "running": "Kører…", "done": "Færdig"}[status]
+        note_html = (
+            f'<div class="step-note">{note}</div>' if note else ""
+        )
         html += f"""
         <div class="step-card {status}">
           {bar}
@@ -502,6 +523,7 @@ def render_steps(placeholder):
           <div class="step-info">
             <div class="step-name">{defn['name']}</div>
             <span class="agent-badge {defn['badge_cls']}">{defn['badge_label']}</span>
+            {note_html}
           </div>
           <div class="step-status status-{status}">{label}</div>
         </div>
@@ -541,9 +563,7 @@ left, right = st.columns([3, 2], gap="large")
 with right:
     st.markdown('<div class="section-label">Udførelses-pipeline</div>', unsafe_allow_html=True)
     steps_placeholder = st.empty()
-    if not st.session_state.steps:
-        st.session_state.steps = [{"status": "pending"} for _ in STEP_DEFS]
-    render_steps(steps_placeholder)
+    render_steps(steps_placeholder)   # always safe — steps pre-initialised above
 
 with left:
     st.markdown('<div class="section-label">Assistent</div>', unsafe_allow_html=True)
@@ -562,7 +582,12 @@ with left:
 # ------------------------------------------------------------
 if user_prompt:
     st.session_state.messages.append({"role": "user", "content": user_prompt})
-    st.session_state.steps = [{"status": "pending"} for _ in STEP_DEFS]
+
+    # Reset steps with empty notes
+    st.session_state.steps = [
+        {"status": "pending", "note": ""} for _ in STEP_DEFS
+    ]
+    st.session_state.last_response = ""
     render_steps(steps_placeholder)
 
     with left:
@@ -570,7 +595,8 @@ if user_prompt:
             st.markdown(user_prompt)
 
         with st.chat_message("assistant"):
-            assistant_box = st.empty()
+            response_placeholder = st.empty()
+            accumulated_text = ""
 
             async_gen = runner.astream(
                 user_id="user1",
@@ -579,28 +605,48 @@ if user_prompt:
             )
 
             for event in run_async(async_gen):
+
+                # ── Tool call → update step notes ──────────────────
                 if getattr(event, "has_tool_calls", False):
                     tc = event.tool_calls[0]
+
                     if tc.tool_name == "InventoryProjectionAgent":
                         st.session_state.steps[0]["status"] = "running"
+                        st.session_state.steps[0]["note"]   = "Fremskriver lagerniveauer og dækningsdage…"
                         render_steps(steps_placeholder)
-                        st.session_state.steps[0]["status"] = "done"
-                        st.session_state.steps[1]["status"] = "running"
-                        render_steps(steps_placeholder)
+
                     if tc.tool_name == "LiveFactpackAgent":
-                        st.session_state.steps[1]["status"] = "done"
-                        st.session_state.steps[2]["status"] = "running"
+                        st.session_state.steps[0]["status"] = "done"
+                        st.session_state.steps[0]["note"]   = "Fremskrivning fuldført"
+                        st.session_state.steps[1]["status"] = "running"
+                        st.session_state.steps[1]["note"]   = "Validerer mod aktuel performance og undtagelser…"
                         render_steps(steps_placeholder)
 
-                if getattr(event, "agent_name", None) == MANAGER_NAME:
-                    if getattr(event, "text", None):
-                        assistant_box.markdown(event.text)
+                # ── Tool result → mark step 2 done, start synthesis ─
+                if getattr(event, "has_tool_results", False):
+                    if st.session_state.steps[1]["status"] == "running":
+                        st.session_state.steps[1]["status"] = "done"
+                        st.session_state.steps[1]["note"]   = "Performancecheck fuldført"
+                        st.session_state.steps[2]["status"] = "running"
+                        st.session_state.steps[2]["note"]   = "Udarbejder ledelsesoversigt…"
+                        render_steps(steps_placeholder)
 
+                # ── Streaming text from manager ─────────────────────
+                if getattr(event, "agent_name", None) == MANAGER_NAME:
+                    chunk = getattr(event, "text", None)
+                    if chunk:
+                        accumulated_text += chunk
+                        response_placeholder.markdown(accumulated_text + "▌")
+
+                # ── Final response ──────────────────────────────────
                 if hasattr(event, "is_final_response") and event.is_final_response():
                     st.session_state.steps[2]["status"] = "done"
+                    st.session_state.steps[2]["note"]   = "Oversigt klar"
                     render_steps(steps_placeholder)
+                    response_placeholder.markdown(accumulated_text)
 
-            final_text = getattr(assistant_box, "_value", "") or ""
+            # Store plain text (never the widget object)
+            st.session_state.last_response = accumulated_text
             st.session_state.messages.append(
-                {"role": "assistant", "content": final_text}
+                {"role": "assistant", "content": accumulated_text}
             )
