@@ -1,5 +1,5 @@
 # ============================================================
-# Supply Chain Control Tower — Multi‑Agent Streamlit App
+# Supply Chain Control Tower — Step‑Based Orchestration View
 # ============================================================
 
 import os
@@ -13,9 +13,9 @@ from orxhestra.tools.agent_tool import AgentTool
 
 
 # ------------------------------------------------------------
-# Helper: consume async generator safely in Streamlit
+# Helper: run async generator in Streamlit
 # ------------------------------------------------------------
-def run_async_generator(async_gen):
+def run_async(async_gen):
     loop = asyncio.new_event_loop()
     try:
         while True:
@@ -28,28 +28,23 @@ def run_async_generator(async_gen):
 
 
 # ------------------------------------------------------------
-# Streamlit config
+# Page config
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="Supply Chain Control Tower — Multi‑Agent Demo",
+    page_title="Supply Chain Control Tower — Execution View",
     layout="wide",
 )
 
-st.title("🛰️ Supply Chain Control Tower — Multi‑Agent Demo")
+st.title("🛰️ Supply Chain Control Tower — Execution View")
 
 
 # ------------------------------------------------------------
-# Sidebar (controls + trace)
+# Sidebar: model config
 # ------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
     model_name = st.selectbox("Model", ["gpt-4o-mini"], index=0)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
-
-    st.divider()
-    st.subheader("🔍 Live Delegation Trace")
-    trace_box = st.empty()
-    st.caption("Shows when the manager calls specialist agents")
 
 
 # ------------------------------------------------------------
@@ -58,11 +53,11 @@ with st.sidebar:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "buffers" not in st.session_state:
-    st.session_state.buffers = {}
+if "steps" not in st.session_state:
+    st.session_state.steps = []
 
-if "trace" not in st.session_state:
-    st.session_state.trace = []
+if "current_step" not in st.session_state:
+    st.session_state.current_step = None
 
 
 # ------------------------------------------------------------
@@ -74,51 +69,21 @@ llm = ChatOpenAI(model=model_name, temperature=temperature)
 # ------------------------------------------------------------
 # Specialist agents
 # ------------------------------------------------------------
-inventory_projection_agent = LlmAgent(
+inventory_agent = LlmAgent(
     name="InventoryProjectionAgent",
     llm=llm,
-    instructions=(
-        "You are an Inventory Projection Analyst.\n"
-        "Explain inventory projection and KPI impact (Service Level, DOI).\n"
-        "Structure:\n"
-        "- Executive bullets\n"
-        "- KPI impact\n"
-        "- Assumptions / scenario levers\n"
-        "- Recommended actions"
-    ),
+    instructions="Provide inventory projection and KPI implications."
 )
 
-live_factpack_agent = LlmAgent(
+factpack_agent = LlmAgent(
     name="LiveFactpackAgent",
     llm=llm,
-    instructions=(
-        "You are a Live Factpack Analyst.\n"
-        "Summarize current performance and exceptions.\n"
-        "Structure:\n"
-        "- Headline performance\n"
-        "- Top exceptions\n"
-        "- Likely drivers\n"
-        "- Next actions"
-    ),
-)
-
-stockout_rootcause_agent = LlmAgent(
-    name="StockoutRootCauseAgent",
-    llm=llm,
-    instructions=(
-        "You are a Stockout / Availability Analyst.\n"
-        "Explain why availability dropped.\n"
-        "Structure:\n"
-        "- What happened\n"
-        "- Root causes\n"
-        "- What to check\n"
-        "- Corrective actions"
-    ),
+    instructions="Provide current performance and key exceptions."
 )
 
 
 # ------------------------------------------------------------
-# Manager agent (IMPORTANT: forces multi‑agent interaction)
+# Manager with EXPLICIT STEP CONTRACT
 # ------------------------------------------------------------
 MANAGER_NAME = "SupplyTowerManager"
 
@@ -126,30 +91,24 @@ manager = LlmAgent(
     name=MANAGER_NAME,
     llm=llm,
     tools=[
-        AgentTool(inventory_projection_agent),
-        AgentTool(live_factpack_agent),
-        AgentTool(stockout_rootcause_agent),
+        AgentTool(inventory_agent),
+        AgentTool(factpack_agent),
     ],
     instructions=(
         "You are the Supply Chain Control Tower Manager.\n\n"
-        "For EVERY user request:\n"
-        "1) Call ONE primary specialist based on intent.\n"
-        "2) Call ONE secondary specialist to cross‑check.\n"
-        "   - If primary = InventoryProjectionAgent → also call LiveFactpackAgent\n"
-        "   - If primary = LiveFactpackAgent → also call StockoutRootCauseAgent\n"
-        "   - If primary = StockoutRootCauseAgent → also call LiveFactpackAgent\n"
-        "3) Synthesize a clear executive summary and actions.\n\n"
-        "Routing hints:\n"
-        "- projection / forecast / scenario / DOI → InventoryProjectionAgent\n"
-        "- today / performance / factpack → LiveFactpackAgent\n"
-        "- stockout / availability / service drop → StockoutRootCauseAgent"
+        "You MUST follow these steps in order:\n"
+        "STEP 1: Call InventoryProjectionAgent to understand forward-looking impact.\n"
+        "STEP 2: Call LiveFactpackAgent to validate against current performance.\n"
+        "STEP 3: Synthesize an executive summary with decisions and actions.\n\n"
+        "Do not skip steps."
     ),
+    max_iterations=3,
 )
 
 
 runner = Runner(
     agent=manager,
-    app_name="supply-chain-control-tower",
+    app_name="control-tower-execution",
     session_service=InMemorySessionService(),
 )
 
@@ -159,18 +118,18 @@ runner = Runner(
 # ------------------------------------------------------------
 left, right = st.columns([3, 2], gap="large")
 
+
+# ------------------------------------------------------------
+# Right panel: EXECUTION TRACKER
+# ------------------------------------------------------------
 with right:
-    st.subheader("🧭 Control Tower Views")
-
-    b1 = st.button("📌 Daily Live Factpack (exceptions)")
-    b2 = st.button("📈 Inventory Projection (scenario impact)")
-    b3 = st.button("🧯 Stockout RCA (why availability dropped)")
-
-    st.divider()
-    st.subheader("📂 Output (by agent)")
-    output_placeholder = st.empty()
+    st.subheader("🧭 Execution Steps")
+    steps_box = st.container()
 
 
+# ------------------------------------------------------------
+# Left panel: chat
+# ------------------------------------------------------------
 with left:
     st.subheader("💬 Control Tower Assistant")
 
@@ -179,30 +138,14 @@ with left:
             st.markdown(msg["content"])
 
     user_prompt = st.chat_input(
-        "Ask the Control Tower… (e.g. Why did service level drop this week?)"
+        "Ask the Control Tower (e.g. Why did service level drop this week?)"
     )
 
 
 # ------------------------------------------------------------
-# Map buttons → prompts
-# ------------------------------------------------------------
-if b1:
-    user_prompt = "Give me today's live factpack with exceptions and next actions."
-if b2:
-    user_prompt = (
-        "Project inventory and KPIs under baseline vs improved replenishment."
-    )
-if b3:
-    user_prompt = (
-        "Why did availability drop and what are the main stockout root causes?"
-    )
-
-
-# ------------------------------------------------------------
-# Run agents
+# Run
 # ------------------------------------------------------------
 if user_prompt:
-    # Show user message
     st.session_state.messages.append(
         {"role": "user", "content": user_prompt}
     )
@@ -211,14 +154,29 @@ if user_prompt:
         with st.chat_message("user"):
             st.markdown(user_prompt)
 
-    # Reset state per run
-    st.session_state.buffers = {}
-    st.session_state.trace = []
-    trace_box.markdown("")
+    # Reset steps
+    st.session_state.steps = [
+        {"name": "Inventory projection", "status": "pending"},
+        {"name": "Validate with live performance", "status": "pending"},
+        {"name": "Executive synthesis & actions", "status": "pending"},
+    ]
+
+    def render_steps():
+        steps_box.empty()
+        with steps_box:
+            for s in st.session_state.steps:
+                icon = {
+                    "pending": "⏳",
+                    "running": "▶️",
+                    "done": "✅",
+                }[s["status"]]
+                st.markdown(f"{icon} **{s['name']}**")
+
+    render_steps()
 
     with left:
         with st.chat_message("assistant"):
-            assistant_placeholder = st.empty()
+            assistant_box = st.empty()
 
             async_gen = runner.astream(
                 user_id="user1",
@@ -226,51 +184,32 @@ if user_prompt:
                 new_message=user_prompt,
             )
 
-            for event in run_async_generator(async_gen):
-                # IMPORTANT: use branch first for sub‑agents
-                agent = (
-                    getattr(event, "branch", None)
-                    or getattr(event, "agent_name", None)
-                    or "unknown"
-                )
-                text = getattr(event, "text", None)
-
-                # ---- Trace delegation ----
+            for event in run_async(async_gen):
+                # Detect tool calls → map to steps
                 if getattr(event, "has_tool_calls", False):
                     tc = event.tool_calls[0]
-                    st.session_state.trace.append(
-                        f"**{MANAGER_NAME} → {tc.tool_name}**"
-                    )
-                    trace_box.markdown("\n".join(st.session_state.trace))
 
-                # ---- Buffer per agent ----
-                if text:
-                    st.session_state.buffers.setdefault(agent, "")
-                    st.session_state.buffers[agent] += text
+                    if tc.tool_name == "InventoryProjectionAgent":
+                        st.session_state.steps[0]["status"] = "running"
+                        render_steps()
+                        st.session_state.steps[0]["status"] = "done"
+                        st.session_state.steps[1]["status"] = "running"
+                        render_steps()
 
-                # ---- LEFT: manager only ----
-                manager_text = st.session_state.buffers.get(
-                    MANAGER_NAME, ""
-                ).strip()
-                if manager_text:
-                    assistant_placeholder.markdown(manager_text)
+                    if tc.tool_name == "LiveFactpackAgent":
+                        st.session_state.steps[1]["status"] = "done"
+                        st.session_state.steps[2]["status"] = "running"
+                        render_steps()
 
-                # ---- RIGHT: specialists only ----
-                rendered = ""
-                for a in [
-                    "InventoryProjectionAgent",
-                    "LiveFactpackAgent",
-                    "StockoutRootCauseAgent",
-                ]:
-                    if a in st.session_state.buffers and st.session_state.buffers[a].strip():
-                        rendered += f"### {a}\n{st.session_state.buffers[a].strip()}\n\n"
+                # Final synthesis
+                if getattr(event, "agent_name", None) == MANAGER_NAME:
+                    if getattr(event, "text", None):
+                        assistant_box.markdown(event.text)
 
-                output_placeholder.markdown(rendered)
+                if hasattr(event, "is_final_response") and event.is_final_response():
+                    st.session_state.steps[2]["status"] = "done"
+                    render_steps()
 
-            # Persist final manager answer
             st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": manager_text or "Done.",
-                }
+                {"role": "assistant", "content": assistant_box}
             )
